@@ -1,0 +1,19 @@
+#!/bin/bash
+MODULE_NAME=$1
+
+LINEAGE=$(pstree -s -a $$)
+
+logger -t KERNEL_BLOCKED "WARNING: Blocked attempt to load module '$MODULE_NAME'. Triggered by: $LINEAGE. "
+
+
+DBUS_USER=$(w -h | awk '{print $1}' | head -n1)
+if [ -n "$DBUS_USER" ]; then
+    USER_ID=$(id -u "$DBUS_USER")
+    sudo -u "$DBUS_USER" DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_ID/bus notify-send \
+        -u critical \
+        "Kernel Security Alert" \
+        "Blocked attempt to load: <b>$MODULE_NAME</b>\n<b>Triggered By:</b>\n$LINEAGE\nAdd $MODULE_NAME to /etc/modulejail/whitelist.conf to unblock."
+fi
+
+# Exit with 1 to signal to modprobe that the installation failed
+exit 1

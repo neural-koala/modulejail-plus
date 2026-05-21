@@ -1,0 +1,830 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Jasper Nuyens <jnuyens@linuxbe.com>
+# ModuleJail: shrink a Linux host's kernel-module attack surface.
+set -eu
+
+# Force C locale for the whole pipeline. comm -23 requires its inputs to be
+# sorted byte-identically; under a non-C locale (e.g. en_US.UTF-8 or
+# tr_TR.UTF-8) sort uses locale-aware collation, which can silently desync
+# the universe/keep ordering and produce wrong set arithmetic. Also
+# stabilises awk regex matching.
+LC_ALL=C
+export LC_ALL
+
+# --- Tool version + sysexits.h exit code constants ---
+# VERSION is the single source of truth for both --version and the
+# generated blacklist header. Bump on every release per SemVer.
+VERSION='1.2.3'
+EX_OK=0
+# sysexits.h conventional codes (see man 3 sysexits):
+#   64=usage 65=dataerr 66=noinput 70=software 71=oserr 73=cantcreat 77=noperm
+EX_USAGE=64
+EX_DATAERR=65
+EX_NOINPUT=66
+EX_SOFTWARE=70
+EX_OSERR=71
+EX_CANTCREAT=73
+EX_NOPERM=77
+
+# --- Defaults (set before arg parsing) ---
+profile=conservative
+output=/etc/modprobe.d/modulejail-blacklist.conf
+WHITELIST_FILE=''
+NO_WHITELIST_FILE=''
+NO_SYSLOG_LOGGING=''
+USE_LOGGER=''
+FAIL_ON_MODULE_LOAD=0
+
+# Path checked for a site-local whitelist when --whitelist-file is not given.
+# When the file exists, it is loaded automatically with the same strict
+# validation as --whitelist-file. When absent, no error (mirrors v1.1.4
+# behavior for hosts that don't ship one). Operators opt out with
+# --no-whitelist-file or by removing the file.
+#
+# Overridable via MODULEJAIL_DEFAULT_WHITELIST_FILE for test fixtures (test-only
+# plumbing, cf. MODULEJAIL_PROC_MODULES / MODULEJAIL_KVER / MODULEJAIL_LOGGER_PATH).
+DEFAULT_WHITELIST_FILE="${MODULEJAIL_DEFAULT_WHITELIST_FILE:-/etc/modulejail/whitelist.conf}"
+
+# --- Built-in baseline module lists (space-separated strings, not bash arrays) ---
+# Each profile inherits from the one above via variable interpolation (DRY).
+# Module names are in canonical underscore form; the pipeline normalizes both forms.
+
+# BASELINE_MINIMAL (16 entries):
+# Core filesystems, NLS deps for vfat/ESP, loop/overlay/autofs, crc32c/crc16.
+# Intent: "Won't break a box that's already booted" — safety net for hosts
+# where most drivers are compiled in but a few modular essentials remain.
+BASELINE_MINIMAL='ext4 xfs btrfs vfat fat nls_cp437 nls_iso8859_1 nls_utf8 tmpfs loop overlay autofs4 crc32c_generic crc32c_intel libcrc32c crc16'
+
+# BASELINE_CONSERVATIVE (MINIMAL + 39 entries ≈ 55 total):
+# Virtio/KVM, common storage controllers, common ethernet NICs, HID/input,
+# dm-crypt/LVM, and crypto primitives. Default profile.
+# Intent: "Bare-metal or VM Linux server across the mainstream hardware matrix."
+BASELINE_CONSERVATIVE="$BASELINE_MINIMAL virtio virtio_ring virtio_pci virtio_blk virtio_net virtio_scsi virtio_balloon virtio_rng nvme nvme_core ahci libahci libata sd_mod sr_mod scsi_mod usb_storage uas e1000 e1000e igb igc ixgbe r8169 tg3 bnxt_en bnx2 hid hid_generic usbhid i8042 dm_mod dm_crypt dm_mirror aes_generic aesni_intel sha256_generic xts cbc"
+
+# BASELINE_DESKTOP (CONSERVATIVE + ~50 entries ≈ 105 total):
+# Graphics/DRM, WiFi, Bluetooth, audio (ALSA/HDA), USB host controllers,
+# misc desktop peripherals, and webcam/video4linux.
+# Intent: "Laptop or workstation — won't break WiFi, BT, audio, or video."
+# shellcheck disable=SC2034  # referenced indirectly via the profile case statement
+BASELINE_DESKTOP="$BASELINE_CONSERVATIVE drm drm_kms_helper i915 amdgpu radeon nouveau nvidia ttm video backlight cfg80211 mac80211 iwlwifi iwlmvm iwldvm ath9k ath10k_core ath10k_pci ath11k brcmfmac brcmsmac rtw88_core rtw89_core rtl8xxxu bluetooth btusb btintel btrtl btbcm hci_uart snd snd_pcm snd_timer snd_hda_intel snd_hda_codec snd_hda_codec_realtek snd_hda_codec_hdmi snd_hda_codec_generic snd_usb_audio snd_seq xhci_hcd xhci_pci ehci_hcd ehci_pci uhci_hcd usblp cdc_acm joydev evdev videodev uvcvideo media"
+
+# === SYSADMIN WHITELIST ===
+# Site-local additions to the keep-set, in addition to the selected baseline
+# profile. Modules listed here will never appear in the generated blacklist.
+#
+# Format: space-separated module names in canonical underscore form
+#         (the pipeline normalizes - to _, so either form works).
+# Default: empty.
+#
+# Example (uncomment and adapt — `nft_compat` is the iptables-nft
+# compatibility shim, a plausible netfilter module a sysadmin running
+# iptables on a modern host might want to keep beyond the baseline):
+# WHITELIST='nft_compat xt_owner'
+WHITELIST=''
+# === END SYSADMIN WHITELIST ===
+
+# --- usage(): print help text; caller decides exit code ---
+usage() {
+    printf 'modulejail — shrink a Linux host'\''s kernel-module attack surface\n'
+    printf '\n'
+    printf 'Usage: modulejail [OPTIONS]\n'
+    printf '\n'
+    printf 'Options:\n'
+    printf '  -p, --profile {minimal|conservative|desktop}\n'
+    printf '                    Built-in baseline profile (default: conservative)\n'
+    printf '  -o, --output PATH Output path for the generated blacklist file\n'
+    printf '                    (default: /etc/modprobe.d/modulejail-blacklist.conf)\n'
+    printf '  --whitelist-file PATH\n'
+    printf '                    Append module names from PATH to the keep-set.\n'
+    printf '                    One module per line; '\''#'\'' starts a comment.\n'
+    printf '                    File must not be group- or world-writable.\n'
+    printf '                    Default (auto-detected if present and no flag passed):\n'
+    printf '                    /etc/modulejail/whitelist.conf\n'
+    printf '  --no-whitelist-file\n'
+    printf '                    Skip the default whitelist file even if present.\n'
+    printf '                    Mutually exclusive with --whitelist-file PATH.\n'
+    printf '  --no-syslog-logging\n'
+    printf '                    Force '\''/bin/true'\'' install lines (v1.1.4 behavior).\n'
+    printf '                    By default, when /usr/bin/logger is present, blocked\n'
+    printf '                    module loads are logged to syslog with tag '\''modulejail'\''.\n'
+    printf '  -f, --fail-on-module-load\n'
+    printf '                    Blocked module loads return a non-zero exit code\n'
+    printf '                    (modprobe fails loudly). Default: blocked loads\n'
+    printf '                    silently succeed (modprobe returns 0).\n'
+    printf '  -V, --version     Show program version and exit\n'
+    printf '  -h, --help        Show this help text and exit\n'
+    printf '\n'
+    printf 'Profiles:\n'
+    printf '  minimal       Core filesystems + essential kernel modules only\n'
+    printf '  conservative  Minimal + common server/VM drivers (default)\n'
+    printf '  desktop       Conservative + WiFi, Bluetooth, audio, video drivers\n'
+    printf '\n'
+    printf 'Defaults:\n'
+    printf '  profile:        conservative\n'
+    printf '  output:         /etc/modprobe.d/modulejail-blacklist.conf\n'
+    printf '  whitelist file: /etc/modulejail/whitelist.conf (auto-detected if present)\n'
+    printf '\n'
+    printf 'Exit codes:\n'
+    printf '  0   success\n'
+    printf '  64  command-line argument error (bad flag, missing value, unknown profile)\n'
+    printf '  65  invalid data in whitelist file (malformed module name)\n'
+    printf '  66  required kernel input missing (/proc/modules or /lib/modules/<kernel>)\n'
+    printf '  70  sanity guard tripped (empty blacklist or >99%% of modules blacklisted)\n'
+    printf '  71  OS-level error (mktemp work dir, or find errors on /lib/modules)\n'
+    printf '  73  output path cannot be created (symlink/directory/trailing-slash, or mktemp failure)\n'
+    printf '  77  target directory not writable (try sudo, or use -o <other-path>)\n'
+    printf '\n'
+    printf 'Environment:\n'
+    printf '  MODULEJAIL_NO_UPDATE_CHECK   Set to any non-empty value to skip the post-run\n'
+    printf '                               check for a newer release on GitHub.\n'
+    printf '  MODULEJAIL_LOGGER_PATH       Path to the logger binary used for the syslog\n'
+    printf '                               install-line detection (default: /usr/bin/logger).\n'
+    printf '                               Test-only plumbing; end-user operators leave unset.\n'
+    printf '  MODULEJAIL_DEFAULT_WHITELIST_FILE\n'
+    printf '                               Override the auto-detected whitelist path\n'
+    printf '                               (default: /etc/modulejail/whitelist.conf).\n'
+    printf '                               Test-only plumbing; end-user operators leave unset.\n'
+}
+
+# --- Argument parser (manual case loop — POSIX, supports long options) ---
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--profile)
+            [ $# -ge 2 ] || { printf 'modulejail: error: %s requires an argument\n' "$1" >&2; exit $EX_USAGE; }
+            profile=$2
+            shift 2
+            ;;
+        --profile=*)
+            profile=${1#--profile=}
+            shift
+            ;;
+        -o|--output)
+            [ $# -ge 2 ] || { printf 'modulejail: error: %s requires an argument\n' "$1" >&2; exit $EX_USAGE; }
+            output=$2
+            shift 2
+            ;;
+        --output=*)
+            output=${1#--output=}
+            shift
+            ;;
+        --whitelist-file)
+            [ $# -ge 2 ] || { printf 'modulejail: error: --whitelist-file requires PATH argument\n' >&2; exit $EX_USAGE; }
+            WHITELIST_FILE="$2"
+            shift 2
+            ;;
+        --whitelist-file=*)
+            WHITELIST_FILE="${1#*=}"
+            [ -n "$WHITELIST_FILE" ] || { printf 'modulejail: error: --whitelist-file= requires non-empty PATH\n' >&2; exit $EX_USAGE; }
+            shift
+            ;;
+        --no-whitelist-file)
+            NO_WHITELIST_FILE=1
+            shift
+            ;;
+        --no-syslog-logging)
+            NO_SYSLOG_LOGGING=1
+            shift
+            ;;
+        -f|--fail-on-module-load)
+            FAIL_ON_MODULE_LOAD=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit $EX_OK
+            ;;
+        -V|--version)
+            printf 'modulejail %s\n' "$VERSION"
+            printf 'https://github.com/jnuyens/modulejail\n'
+            printf 'License: GPL-3.0-only (https://spdx.org/licenses/GPL-3.0-only.html)\n'
+            exit $EX_OK
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            printf 'modulejail: error: unknown option: %s\n' "$1" >&2
+            exit $EX_USAGE
+            ;;
+        *)
+            printf 'modulejail: error: unexpected positional argument: %s\n' "$1" >&2
+            exit $EX_USAGE
+            ;;
+    esac
+done
+
+# --- Validate profile ---
+case "$profile" in
+    minimal|conservative|desktop) ;;
+    *) printf 'modulejail: error: unknown profile: %s (expected minimal, conservative, desktop)\n' "$profile" >&2; exit $EX_USAGE ;;
+esac
+
+# --- Reject contradictory whitelist-file flags ---
+# Explicit-path-plus-opt-out is ambiguous; refuse rather than silently
+# letting one win.
+if [ -n "$WHITELIST_FILE" ] && [ -n "$NO_WHITELIST_FILE" ]; then
+    printf 'modulejail: error: --whitelist-file PATH and --no-whitelist-file are mutually exclusive\n' >&2
+    exit $EX_USAGE
+fi
+
+# --- Default whitelist file auto-detection ---
+# Per Issue #2 followup (bpmartin20, james-rimu, 2026-05): a default path
+# under /etc/modulejail/ catches the "forgot the flag" silent-error case.
+# Only kick in when:
+#   - user did not pass --whitelist-file PATH, AND
+#   - user did not pass --no-whitelist-file, AND
+#   - the default file exists.
+# Validation/permission gate inside parse_whitelist_file runs the same way
+# as for an explicit path — an existing but malformed/unsafe default file
+# is a loud error, never a silent skip.
+if [ -z "$WHITELIST_FILE" ] && [ -z "$NO_WHITELIST_FILE" ] && [ -e "$DEFAULT_WHITELIST_FILE" ]; then
+    WHITELIST_FILE="$DEFAULT_WHITELIST_FILE"
+    printf 'modulejail: info: using default whitelist file %s (--no-whitelist-file to opt out)\n' "$DEFAULT_WHITELIST_FILE" >&2
+fi
+
+# --- Logger detection (generation-time, one-shot per run) ---
+# The opt-out flag NO_SYSLOG_LOGGING wins. Otherwise, emit the logger
+# install-line iff the running host has an executable logger binary.
+# This is a one-shot check at generation time (not a per-modprobe
+# eval). The emitted install line itself uses `; exit 0` for
+# heterogeneous-fleet robustness (so a missing logger at modprobe
+# time still returns 0).
+#
+# Path is overridable via MODULEJAIL_LOGGER_PATH for test fixtures
+# (test-only plumbing, cf. MODULEJAIL_PROC_MODULES / MODULEJAIL_KVER /
+# MODULEJAIL_MODULES_ROOT). End-user operators leave it unset; the
+# default is /usr/bin/logger.
+if [ -z "$NO_SYSLOG_LOGGING" ] && [ -x "${MODULEJAIL_LOGGER_PATH:-/usr/bin/logger}" ]; then
+    USE_LOGGER=1
+fi
+
+# --- Pre-flight: verify this is a Linux host with the required kernel ---
+# interfaces. Run this BEFORE the writability gate so non-Linux operators
+# get an accurate "not a Linux host" diagnostic instead of a misleading
+# "cannot write to /etc/modprobe.d" message.
+# /proc/modules path is overridable via MODULEJAIL_PROC_MODULES for
+# test fixtures that cannot expose a synthetic /proc (test-only plumbing,
+# cf. TMPDIR, GIT_DIR). End-user operators leave it unset.
+if [ ! -e "${MODULEJAIL_PROC_MODULES:-/proc/modules}" ]; then
+    printf 'modulejail: error: %s not found (is this a Linux host?)\n' \
+        "${MODULEJAIL_PROC_MODULES:-/proc/modules}" >&2
+    exit $EX_NOINPUT
+fi
+# Kernel version overridable via MODULEJAIL_KVER for test fixtures
+# (test-only plumbing; containers share the host kernel via uname -r,
+# so synthetic module trees need a pinned version).
+_kver="${MODULEJAIL_KVER:-$(uname -r)}"
+# Modules-tree root overridable via MODULEJAIL_MODULES_ROOT for test
+# fixtures (test-only plumbing, cf. MODULEJAIL_PROC_MODULES / MODULEJAIL_KVER).
+# End-user operators leave it unset (defaults to /lib/modules). This lets
+# host-local case scripts on a non-Linux dev box build a synthetic tree under
+# $TMPDIR and exercise the full pipeline without requiring root or a writable
+# /lib/modules.
+_modules_root="${MODULEJAIL_MODULES_ROOT:-/lib/modules}"
+if [ ! -d "$_modules_root/$_kver" ]; then
+    printf 'modulejail: error: %s/%s does not exist (kernel module tree missing)\n' "$_modules_root" "$_kver" >&2
+    exit $EX_NOINPUT
+fi
+
+# --- Pre-flight: reject $output that is (or could become) a directory. ---
+# Without this, `-o /etc/modprobe.d` (or any existing directory — easy slip
+# with shell completion or a copy-paste from docs) would pass dirname, pass
+# the writability gate, and have `mv` quietly drop the temp file *inside*
+# the directory under its randomized name. modprobe ignores dotfiles, so
+# the host would silently end up unprotected. Catch both forms here.
+if [ -d "$output" ]; then
+    printf 'modulejail: error: -o %s is a directory; expected a file path\n' "$output" >&2
+    exit $EX_CANTCREAT
+fi
+case "$output" in
+    */) printf 'modulejail: error: -o %s ends with /, expected a file path\n' "$output" >&2; exit $EX_CANTCREAT ;;
+esac
+
+# --- Pre-flight: refuse a symlinked output target. ---
+# `mv -- "$tmp" "$output"` would follow the symlink and replace the *target*,
+# not the link. On a multi-tenant or misconfigured host this can write
+# outside /etc/modprobe.d/. Honour the atomic-rename safety story by
+# refusing the symlink up front rather than silently following it.
+if [ -L "$output" ]; then
+    printf 'modulejail: error: refusing to overwrite symlink at %s\n' "$output" >&2
+    exit $EX_CANTCREAT
+fi
+
+# --- Pre-flight: writability gate (before any heavy work) ---
+target_dir=$(dirname "$output")
+if ! [ -w "$target_dir" ]; then
+    printf 'modulejail: error: cannot write to %s (try sudo, or use -o <other-path>)\n' "$target_dir" >&2
+    exit $EX_NOPERM
+fi
+
+# === PIPELINE ===
+
+# Per-invocation work directory — all intermediate sorted files live here.
+# Cleaned up on any exit path (success, failure, signal).
+# Use the explicit-template form rather than `mktemp -t modulejail.XXXXXX`:
+# the `-t` flag has three incompatible meanings across GNU coreutils, BSD,
+# and busybox (Alpine). The full-path template form works identically on
+# all of them and is self-documenting about where the directory lives.
+workdir=$(mktemp -d "${TMPDIR:-/tmp}/modulejail.XXXXXX") || {
+    printf 'modulejail: error: cannot create temporary work directory\n' >&2
+    exit $EX_OSERR
+}
+
+# Install the consolidated cleanup trap NOW (before the second mktemp in the
+# render block), so a signal arriving in the window between creating $tmp and
+# registering it does not orphan the in-target dotfile under /etc/modprobe.d/.
+# $tmp is initially empty; rm -f on an empty argument is a no-op, so the trap
+# is safe to fire before $tmp is assigned.
+tmp=
+# shellcheck disable=SC2329  # invoked via trap string, not direct call
+cleanup() {
+    # shellcheck disable=SC2317  # invoked via trap string, not direct call
+    rm -rf "$workdir"
+    # shellcheck disable=SC2317  # invoked via trap string, not direct call
+    if [ -n "${tmp:-}" ]; then rm -f "$tmp"; fi
+    # Always return 0 from the EXIT trap. Under dash/POSIX /bin/sh, an
+    # EXIT trap whose last command exits non-zero CLOBBERS the script's
+    # original exit status. The previous `[ -n "$tmp" ] && rm -f "$tmp"`
+    # idiom returned 1 whenever $tmp was still empty (every error path
+    # before the render block), masking explicit `exit $EX_*` codes.
+    # Surfaced by the new whitelist-file rejection paths (Plan 03-01).
+    return 0
+}
+trap cleanup EXIT INT HUP TERM
+
+# list_universe: walk the FULL modules tree at $_modules_root/$_kver
+# (default: /lib/modules/$(uname -r), NOT just kernel/) so DKMS and
+# weak-updates modules are included.
+# Strip exactly the four known suffixes (.ko, .ko.gz, .ko.xz, .ko.zst);
+# lines that do not match a known suffix are dropped (precision filter for
+# the *.ko* glob). Normalize - to _. Output is sorted, deduped.
+#
+# POSIX /bin/sh has no `pipefail`, so a `find ... | awk ... | sort -u`
+# pipeline silently masks find failures (a permission-denied subtree under
+# weak-updates/, a broken symlink chain, transient I/O) and produces a
+# partial universe, which then under-blacklists the host invisibly.
+# Capture find's stderr to a tempfile in $workdir, run find with stdout
+# to another tempfile, and abort if stderr is non-empty.
+list_universe() {
+    find_out=$workdir/find.out
+    find_err=$workdir/find.err
+    find "$_modules_root/$_kver" -type f -name '*.ko*' \
+        >"$find_out" 2>"$find_err"
+    if [ -s "$find_err" ]; then
+        printf 'modulejail: error: find reported errors walking %s/%s:\n' \
+            "$_modules_root" "$_kver" >&2
+        cat "$find_err" >&2
+        printf 'modulejail: error: refusing to produce a partial blacklist.\n' >&2
+        exit $EX_OSERR
+    fi
+    awk '{
+        n = $0
+        # Keep only the basename
+        sub(/.*\//, "", n)
+        # Strip exactly one of the four known compression suffixes; drop others
+        if (!sub(/\.ko\.gz$/, "", n) && \
+            !sub(/\.ko\.xz$/, "", n) && \
+            !sub(/\.ko\.zst$/, "", n) && \
+            !sub(/\.ko$/, "", n)) next
+        # Normalize - to _ (canonical underscore form)
+        gsub(/-/, "_", n)
+        # Defense-in-depth: reject names containing
+        # anything outside canonical kernel-module characters before
+        # they can land in /etc/modprobe.d/ install lines. The strict
+        # regex gate is what the project documentation positions as
+        # the safety guarantee for modprobe.d directives; without
+        # this line that guarantee only held for the --whitelist-file
+        # path (parse_whitelist_file) and not for the filesystem-walk
+        # path. Write access to /lib/modules/$KVER/ is root-equivalent
+        # today, so this is defense-in-depth, not a CVE fix. A legit
+        # kernel module basename always matches this regex post
+        # dash-to-underscore normalization; nothing real is dropped.
+        if (n !~ /^[a-zA-Z0-9_]+$/) next
+        print n
+    }' "$find_out" | sort -u
+}
+
+# list_loaded: read currently-loaded modules from /proc/modules.
+# Uses /proc/modules directly — no kmod/lsmod runtime dep.
+# Column 1 of /proc/modules is already in canonical underscore form.
+list_loaded() {
+    # /proc/modules path overridable via MODULEJAIL_PROC_MODULES
+    # (test-only plumbing; see pre-flight gate above).
+    #
+    # Defense-in-depth: apply the same canonical-name
+    # filter as list_universe for symmetry. Column 1 of /proc/modules
+    # is kernel-owned and trustworthy in practice, but the strict-regex
+    # gate that the project documentation positions as the guarantee
+    # for modprobe.d directives should hold uniformly across every
+    # source that feeds emit_install_line. A real loaded module always
+    # matches this regex; nothing legitimate is dropped.
+    awk '$1 ~ /^[a-zA-Z0-9_]+$/ {print $1}' \
+        "${MODULEJAIL_PROC_MODULES:-/proc/modules}" | sort -u
+}
+
+# Produce the two canonical input files for set arithmetic.
+list_universe > "$workdir/universe.txt"
+list_loaded   > "$workdir/loaded.txt"
+
+# list_baseline: expand the selected baseline profile ($profile) into a sorted,
+# deduplicated list of canonical underscore module names.
+# BASELINE_* variables are POSIX space-separated strings (NOT bash arrays).
+# We expand them via intentional word-splitting.
+list_baseline() {
+    case "$profile" in
+        minimal)      list=$BASELINE_MINIMAL ;;
+        conservative) list=$BASELINE_CONSERVATIVE ;;
+        desktop)      list=$BASELINE_DESKTOP ;;
+    esac
+    # intentional word-splitting — BASELINE_* are POSIX space-separated lists, not bash arrays
+    # shellcheck disable=SC2086
+    for x in $list; do
+        printf '%s\n' "$x"
+    done \
+    | tr '-' '_' \
+    | sort -u
+}
+
+# list_whitelist: expand $WHITELIST into a sorted, deduplicated list of
+# canonical underscore module names. Parallel to list_baseline above.
+list_whitelist() {
+    # intentional word-splitting — WHITELIST is a POSIX space-separated list, not bash array
+    # shellcheck disable=SC2086
+    for x in $WHITELIST; do
+        printf '%s\n' "$x"
+    done \
+    | tr '-' '_' \
+    | sort -u
+}
+
+# parse_whitelist_file: validate and parse the optional --whitelist-file.
+# Stdin: none. Stdout: zero or more module names, one per line (unsorted).
+# Side effects: errors to stderr and exits non-zero on any rejection.
+# Tolerates leading and trailing whitespace per line: the awk
+# program strips both before validating against the canonical regex, so
+# an indented entry copy-pasted from a YAML or other indented source
+# parses cleanly rather than tripping EX_DATAERR. Blank lines and lines
+# whose first non-blank char is `#` are skipped.
+# Exit codes:
+#   65 (EX_DATAERR) - malformed module name on any non-comment line
+#                     (awk's `END { if (!ok) exit 65 }` data-error path)
+#   66 (EX_NOINPUT) - file does not exist or is unreadable
+#   71 (EX_OSERR)   - awk failed for a non-data reason (OOM, signal, future
+#                     program-edit syntax error); distinguished from EX_DATAERR
+#                     so fleet automation that case-splits on sysexits codes
+#                     reads correctly. (Previously this branch was dead
+#                     code under set -eu because awk's non-zero exit
+#                     aborted the shell at the awk line before we could remap.)
+#   77 (EX_NOPERM)  - file is group- or world-writable
+parse_whitelist_file() {
+    _wf="$1"
+    [ -n "$_wf" ] || return 0   # no file passed; no-op
+    if [ ! -r "$_wf" ]; then
+        printf 'modulejail: error: whitelist file %s does not exist or is not readable\n' "$_wf" >&2
+        exit $EX_NOINPUT
+    fi
+    # Permission check: refuse if group- or world-writable. Use stat with
+    # GNU-form first, BSD-form fallback (macOS, *BSD). The result is an
+    # octal mode string like "644", "664", "666", or "0644" (some stats
+    # include the setuid/setgid/sticky leading digit).
+    _mode=$(stat -c '%a' "$_wf" 2>/dev/null || stat -f '%Lp' "$_wf" 2>/dev/null || echo '')
+    if [ -z "$_mode" ]; then
+        printf 'modulejail: error: could not stat whitelist file %s\n' "$_wf" >&2
+        exit $EX_OSERR
+    fi
+    # POSIX shell has no portable octal arithmetic (bash's $((8#$x)) is
+    # SC3052: non-POSIX). Inspect the group and world octal digits as
+    # strings instead. A digit with the 2-bit set (i.e. write bit) is one
+    # of 2,3,6,7.
+    _last3=$(printf '%s' "$_mode" | awk '{ n=length($0); print substr($0, n-2, 3) }')
+    _group_digit=$(printf '%s' "$_last3" | cut -c2)
+    _other_digit=$(printf '%s' "$_last3" | cut -c3)
+    case "$_group_digit$_other_digit" in
+        *[2367]*)
+            printf 'modulejail: error: whitelist file %s must not be group- or world-writable; run '\''chmod go-w %s'\'' and retry\n' "$_wf" "$_wf" >&2
+            exit $EX_NOPERM
+            ;;
+    esac
+    # Parse the file. Use awk for line-numbered validation - we want the
+    # line number in error messages so operators can find the bad entry.
+    #
+    # Bracket the awk invocation with `set +e` / `set -e` so we can
+    # capture the real return code and route it to a typed sysexits exit.
+    # Without this, `set -eu` at line 5 aborts the shell at the awk line on
+    # any non-zero awk exit, making the dispatch below dead code. Inside
+    # the awk program, the only
+    # documented non-zero exit is `END { if (!ok) exit 65 }`, which maps
+    # to EX_DATAERR (65). Any other non-zero exit indicates an awk-internal
+    # failure (OOM, killed by signal, future program-edit syntax error),
+    # routed to EX_OSERR (71). Two distinct codes; fleet automation case-
+    # splitting on `$?` reads correctly.
+    set +e
+    awk -v file="$_wf" '
+        BEGIN { ok = 1 }
+        # Strip CR (handle CRLF line endings gracefully).
+        { sub(/\r$/, "") }
+        # Strip trailing whitespace.
+        { sub(/[[:space:]]+$/, "") }
+        # Strip leading whitespace symmetric with the trailing
+        # strip above, so a naturally-indented module name (e.g.
+        # "  vfio_pci" copy-pasted from a YAML or other indented
+        # source) is accepted rather than rejected as EX_DATAERR.
+        # Blank-line and comment-line skips below already tolerated
+        # leading whitespace via their own ^[[:space:]]* patterns; this
+        # extends that tolerance to module-name lines for symmetry.
+        { sub(/^[[:space:]]+/, "") }
+        # Skip blank lines.
+        /^[[:space:]]*$/ { next }
+        # Skip comment lines.
+        /^[[:space:]]*#/ { next }
+        # Validate.
+        $0 !~ /^[a-zA-Z0-9_-]+$/ {
+            printf "modulejail: error: whitelist file %s line %d: invalid module name %s (must match [a-zA-Z0-9_-]+)\n", file, NR, $0 > "/dev/stderr"
+            ok = 0
+            next
+        }
+        { print }
+        END { if (!ok) exit 65 }
+    ' "$_wf"
+    _awk_status=$?
+    set -e
+    case "$_awk_status" in
+        0)   ;;                       # clean parse
+        65)  exit $EX_DATAERR ;;      # documented data-error path
+        *)   printf 'modulejail: error: awk failed parsing whitelist file %s (rc=%d)\n' \
+                 "$_wf" "$_awk_status" >&2
+             exit $EX_OSERR ;;
+    esac
+}
+
+# emit_install_line: read sorted module names from $1 (one per line) and
+# print one modprobe.d-format install line per module. Branches on
+# USE_LOGGER (set by the generation-time logger detection above).
+#
+# When USE_LOGGER is set: emit the logger form
+#   install <name> /bin/sh -c '/usr/bin/logger -t modulejail "blocked: <name>" 2>/dev/null; exit 0'
+# When USE_LOGGER is empty: emit the v1.1.4 form
+#   install <name> /bin/true
+# When FAIL_ON_MODULE_LOAD is set, the trailing `exit 0` becomes `/bin/false`
+# and the bare `/bin/true` becomes `/bin/false`, so modprobe returns
+# non-zero for blacklisted modules. The default-off (`FAIL_ON_MODULE_LOAD=0`)
+# install-line bytes are unchanged from v1.2.2 by construction.
+#
+# awk-quoting note: the outer single-quotes around the awk program are
+# closed and reopened around each literal single-quote that has to land
+# in the install-line output ('"'"'"'"' is the canonical sh idiom). The
+# inner double-quotes around "blocked: %s" are part of the install-line
+# string sh will eval at modprobe time. printf's %s is interpolated at
+# generation time by awk, so the emitted line carries a literal module
+# name, not a $name reference.
+emit_install_line() {
+    if [ -n "$USE_LOGGER" ]; then
+        if [ "$FAIL_ON_MODULE_LOAD" -eq 0 ]; then
+            # Default: byte-identical to v1.2.2 (trailing `; exit 0`).
+            awk '{
+                printf "install %s /bin/sh -c '\''/usr/bin/logger -t modulejail \"blocked: %s\" 2>/dev/null; exit 0'\''\n", $1, $1
+            }' "$1"
+        else
+            # Fail mode: `; /bin/false` instead of `; exit 0`, so the
+            # whole install command returns non-zero and modprobe fails.
+            awk '{
+                printf "install %s /bin/sh -c '\''/usr/bin/logger -t modulejail \"blocked: %s\" 2>/dev/null; /bin/false'\''\n", $1, $1
+            }' "$1"
+        fi
+    else
+        if [ "$FAIL_ON_MODULE_LOAD" -eq 0 ]; then
+            # Default: byte-identical to v1.1.4 / v1.2.2 silent form.
+            awk '{print "install " $1 " /bin/true"}' "$1"
+        else
+            # Fail mode: /bin/false makes modprobe fail loudly.
+            awk '{print "install " $1 " /bin/false"}' "$1"
+        fi
+    fi
+}
+
+list_baseline > "$workdir/baseline.txt"
+# parse_whitelist_file may exit non-zero (EX_NOINPUT / EX_NOPERM /
+# EX_DATAERR / EX_OSERR). POSIX /bin/sh has no `pipefail`, so the helper
+# must run OUTSIDE any pipeline for its exits to propagate to the
+# top-level script. Capture its output to a tempfile, then merge with
+# list_whitelist via sort -u.
+parse_whitelist_file "$WHITELIST_FILE" > "$workdir/whitelist-file.txt"
+# Normalize dash to underscore, parallel to list_whitelist / list_baseline /
+# list_universe. The manpage and README document that whitelist entries may
+# be written in either form ("nft-compat" or "nft_compat"); /proc/modules
+# and the universe walker always report the underscore form, so without
+# this normalization a dash-form entry never joined the keep-set and the
+# module was silently blacklisted. (Caught by the v1.2 code-review gate.)
+{
+    list_whitelist
+    tr '-' '_' < "$workdir/whitelist-file.txt"
+} | sort -u > "$workdir/whitelist.txt"
+
+# Compose total keep-list: loaded modules union baseline union whitelist (sorted, deduped).
+cat "$workdir/loaded.txt" "$workdir/baseline.txt" "$workdir/whitelist.txt" | sort -u > "$workdir/keep.txt"
+
+# Set difference: blacklist = universe − keep.
+# comm -23 requires both inputs to be sorted; both universe.txt and keep.txt are.
+comm -23 "$workdir/universe.txt" "$workdir/keep.txt" > "$workdir/blacklist.txt"
+
+# Expose result path for the renderer below.
+# shellcheck disable=SC2034  # consumed by the render block via $blacklist
+blacklist="$workdir/blacklist.txt"
+
+# Sanity guard: abort on degenerate output to avoid bricking a host with
+# an empty or near-total blacklist.
+universe_count=$(wc -l < "$workdir/universe.txt")
+blacklist_count=$(wc -l < "$workdir/blacklist.txt")
+
+if [ "$blacklist_count" -eq 0 ]; then
+    printf 'modulejail: error: computed blacklist is empty; nothing to write.\n' >&2
+    printf 'modulejail: error: check that /proc/modules is readable and the baseline list is correct.\n' >&2
+    exit $EX_SOFTWARE
+fi
+
+if [ "$((blacklist_count * 100))" -gt "$((universe_count * 99))" ]; then
+    printf 'modulejail: error: computed blacklist covers %d of %d modules (>99%% of universe).\n' \
+        "$blacklist_count" "$universe_count" >&2
+    printf 'modulejail: error: This usually means /proc/modules was unreadable or the baseline list is wrong.\n' >&2
+    printf 'modulejail: error: Aborting to avoid an unbootable host.\n' >&2
+    exit $EX_SOFTWARE
+fi
+
+# === FINGERPRINT ===
+# Hash a canonical serialization of (sorted loaded, sorted baseline,
+# sorted whitelist, profile, kernel) so two runs with byte-identical
+# inputs produce byte-identical headers. NO wall-clock anywhere: the
+# header is a deterministic function of inputs, so idempotency is by
+# construction.
+# Use plain `sha256sum` (no flags); busybox lacks `--tag`.
+{
+    printf 'modulejail-fingerprint:v1\n'
+    printf 'profile:%s\n' "$profile"
+    printf 'kernel:%s\n' "$_kver"
+    printf 'loaded:\n'
+    cat "$workdir/loaded.txt"
+    printf 'baseline:\n'
+    cat "$workdir/baseline.txt"
+    printf 'whitelist:\n'
+    cat "$workdir/whitelist.txt"
+} > "$workdir/fingerprint.input"
+fingerprint=$(sha256sum < "$workdir/fingerprint.input" | awk '{print $1}')
+
+# === RENDER ===
+# Render $blacklist into install /bin/true directives and write atomically to $output.
+# Atomic write: mktemp in same dir as $output → chmod 0644 → mv (single rename(2)).
+# This guarantees readers see either the pre-run file or the post-run file, never a
+# partial write.
+
+# target_dir already computed above (writability gate); reuse it. The
+# consolidated cleanup trap was installed earlier (right after $workdir)
+# and already knows about $tmp (initially empty), so the post-mktemp
+# assignment is atomic from the trap's point of view — no signal window
+# can orphan this dotfile in $target_dir.
+tmp=$(mktemp "${target_dir}/.modulejail-blacklist.conf.XXXXXX") || {
+    printf 'modulejail: error: cannot create temp file in %s\n' "$target_dir" >&2
+    exit $EX_CANTCREAT
+}
+
+# Write 7-line header + one install line per blacklisted module. The install
+# line takes one of two forms depending on the generation-time logger
+# detection (see USE_LOGGER above); emit_install_line picks the right form
+# and the header documents which one was chosen.
+# Header contains tool version + repo URL + profile + kernel + sha256 fingerprint +
+# install-line annotation + edit-by-hand disclaimer. NO wall-clock; header is
+# a deterministic function of inputs. Fingerprint is computed above the
+# render block.
+{
+    printf '# modulejail %s\n' "$VERSION"
+    printf '# https://github.com/jnuyens/modulejail\n'
+    printf '# profile: %s\n' "$profile"
+    printf '# kernel: %s\n' "$_kver"
+    printf '# fingerprint: sha256:%s\n' "$fingerprint"
+    if [ -n "$USE_LOGGER" ]; then
+        if [ "$FAIL_ON_MODULE_LOAD" -eq 0 ]; then
+            printf '# install-line: /bin/sh + logger (syslog tag: modulejail)\n'
+        else
+            printf '# install-line: /bin/sh + logger + /bin/false (syslog tag: modulejail, --fail-on-module-load)\n'
+        fi
+    else
+        if [ "$FAIL_ON_MODULE_LOAD" -eq 0 ]; then
+            printf '# install-line: /bin/true (silent, --no-syslog-logging or logger absent)\n'
+        else
+            printf '# install-line: /bin/false (silent, --fail-on-module-load)\n'
+        fi
+    fi
+    printf '# Do not edit by hand — regenerate with modulejail(8).\n'
+    emit_install_line "$blacklist"
+} > "$tmp"
+
+# Set world-readable permissions before rename (umask may be too restrictive;
+# modprobe.d files must be readable by all).
+chmod 0644 "$tmp"
+
+# Atomic rename: single rename(2) syscall; same filesystem guaranteed because
+# $tmp is in $(dirname "$output").
+mv -- "$tmp" "$output"
+
+# Single-line success summary on stdout.
+# Parseable by `awk -F'[ ()=:>-]+'` for fleet log aggregators;
+# quiet enough not to spam Ansible/Puppet output. No --quiet/
+# --verbose toggle in v1: this single line is already minimal.
+printf 'modulejail: blacklisted %d of %d modules (profile=%s) -> %s\n' \
+    "$blacklist_count" "$universe_count" "$profile" "$output"
+
+# === UPDATE CHECK ===
+# Best-effort, silent on any failure. Fetches the GitHub "latest release"
+# redirect target with a 10-second hard timeout and prints a stderr notice
+# only when the discovered tag is strictly newer than VERSION.
+# Honours MODULEJAIL_NO_UPDATE_CHECK=<any non-empty value> to skip.
+
+# ver_cmp: pure-shell SemVer X.Y.Z comparator.
+# Prints 1 if $1 > $2, -1 if $1 < $2, 0 otherwise. Missing or non-numeric
+# components are treated as 0 (defensive: garbage in, 0 out, never error).
+ver_cmp() {
+    a=$1; b=$2
+    a1=${a%%.*}; a_rest=${a#*.}
+    case "$a_rest" in "$a") a_rest=0.0 ;; esac
+    a2=${a_rest%%.*}; a_rest=${a_rest#*.}
+    case "$a_rest" in "$a2") a_rest=0 ;; esac
+    a3=${a_rest%%.*}
+    b1=${b%%.*}; b_rest=${b#*.}
+    case "$b_rest" in "$b") b_rest=0.0 ;; esac
+    b2=${b_rest%%.*}; b_rest=${b_rest#*.}
+    case "$b_rest" in "$b2") b_rest=0 ;; esac
+    b3=${b_rest%%.*}
+    case "$a1" in ''|*[!0-9]*) a1=0 ;; esac
+    case "$a2" in ''|*[!0-9]*) a2=0 ;; esac
+    case "$a3" in ''|*[!0-9]*) a3=0 ;; esac
+    case "$b1" in ''|*[!0-9]*) b1=0 ;; esac
+    case "$b2" in ''|*[!0-9]*) b2=0 ;; esac
+    case "$b3" in ''|*[!0-9]*) b3=0 ;; esac
+    if [ "$a1" -gt "$b1" ]; then echo 1; return; fi
+    if [ "$a1" -lt "$b1" ]; then echo -1; return; fi
+    if [ "$a2" -gt "$b2" ]; then echo 1; return; fi
+    if [ "$a2" -lt "$b2" ]; then echo -1; return; fi
+    if [ "$a3" -gt "$b3" ]; then echo 1; return; fi
+    if [ "$a3" -lt "$b3" ]; then echo -1; return; fi
+    echo 0
+}
+
+# check_for_updates: best-effort latest-tag lookup against the GitHub
+# tags API. Always returns 0; the only externally visible effect is a
+# possible stderr notice when a strictly-newer tag is reachable.
+# URL is overridable via the undocumented MODULEJAIL_UPDATE_URL
+# (test-only plumbing, cf. MODULEJAIL_PROC_MODULES and MODULEJAIL_KVER
+# above). The tags API is used rather than the /releases/latest
+# redirect because it works whether or not GitHub Release objects have
+# been created for the tags.
+check_for_updates() {
+    [ -n "${MODULEJAIL_NO_UPDATE_CHECK:-}" ] && return 0
+    update_url=${MODULEJAIL_UPDATE_URL:-https://api.github.com/repos/jnuyens/modulejail/tags}
+
+    body=
+    if command -v curl >/dev/null 2>&1; then
+        # -f: fail on HTTP 4xx/5xx. -s: silent. -L: follow redirects.
+        # --max-time 10: hard wall-clock cap.
+        body=$(curl -fsL --max-time 10 "$update_url" 2>/dev/null) || return 0
+    elif command -v wget >/dev/null 2>&1; then
+        # Use the universal short-flag subset accepted by both GNU wget
+        # and busybox wget (Alpine ships only the latter). busybox wget
+        # rejects --max-redirect / --output-document / --quiet long forms
+        # and exits non-zero, which previously made the update check
+        # silently fail on Alpine. The GitHub tags API serves directly
+        # at api.github.com without redirecting, so -L / --max-redirect
+        # are not needed.
+        body=$(wget -q -T 10 -O - "$update_url" 2>/dev/null) || return 0
+    else
+        printf 'modulejail: notice: no curl/wget in PATH, cannot check for update\n' >&2
+        return 0
+    fi
+
+    # Extract the first "name": "..." value from the JSON array.
+    # The tags API returns tags newest-first, so the first match is the
+    # latest. Awk on " as the delimiter pulls field 4 from
+    #     "name": "vX.Y.Z",
+    # which is "vX.Y.Z" (without quotes).
+    latest_tag=$(printf '%s\n' "$body" \
+                 | awk -F'"' '/^[[:space:]]*"name"[[:space:]]*:/ { print $4; exit }')
+    [ -n "$latest_tag" ] || return 0
+
+    latest_ver=${latest_tag#v}
+    case "$latest_ver" in
+        [0-9]*.[0-9]*.[0-9]*) ;;
+        *) return 0 ;;
+    esac
+
+    if [ "$(ver_cmp "$latest_ver" "$VERSION")" = "1" ]; then
+        printf 'modulejail: notice: a newer release is available: v%s (you have %s)\n' \
+            "$latest_ver" "$VERSION" >&2
+        printf 'modulejail: notice: https://github.com/jnuyens/modulejail/releases/latest\n' >&2
+        printf 'modulejail: notice: set MODULEJAIL_NO_UPDATE_CHECK=1 to disable this check\n' >&2
+    fi
+    return 0
+}
+
+check_for_updates
+
+exit $EX_OK
