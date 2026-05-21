@@ -34,6 +34,11 @@ Although highly unlikely, you might want to know how to fix boot issues if the b
 
 Add `modprobe.blacklist= ` (there is a space at the end) in grub to tell the kernel to ignore all blacklists.
 
+## Using modprobed-db to Track Module Usage
+
+Instead of manually whitelisting modules when occasionally used hardware (e.g., external hard drives) don't work, as prompted by the notification, you can use [modprobed-db](https://github.com/graysky2/modprobed-db) to track the usage of modules over a period of time, before applying the module blacklist.
+
+
 # Disabling Modules Built into the Kernel Image
 
 lsmod only shows loadable modules, but many modules are built into the kernel image, so they never appear in lsmod and ignore modprobe blacklists.
@@ -86,7 +91,7 @@ Then, you can run `python3 ./block-builtin-modules/map_blacklist_to_kconfig_entr
 
 Finally, due to the complexity of kernel configurations, use `make menuconfig` to search for each item printed by the previous step, and set them accordingly, and you can compile a minimal custom linux kernel. 
 
-# Other ways to harden your machine 
+# Other Ways to Harden your Machine 
 Here are some other ideas for hardening your machine:
 - limit the capabilities of root with techniques like SELinux, setcap, seccomp, kernel lockdown mode.
 - use intrusion detection and anomaly detection.
