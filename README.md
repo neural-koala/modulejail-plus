@@ -29,11 +29,6 @@ sudo ./block-modules-and-notify.sh
 `block-modules-and-notify.sh` specifies the `desktop` profile for `modulejail`. You can change this to `conservative` or `minimal`.
 
 
-## Capture all modules your system ever uses
-
-
-linux kernel modules for specific drivers whose hardware is generally not present on people's machines, generally considered vulnerable and might be exploited by hackers, even if the target hardware is not present during exploitation?
-
 ## In Case the Blacklist Caused Issues
 Although highly unlikely, you might want to know how to fix boot issues if the blacklist make your machine unable to boot. 
 
